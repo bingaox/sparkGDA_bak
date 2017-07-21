@@ -22,12 +22,13 @@ import java.nio.ByteBuffer
 import java.util.Properties
 
 import scala.language.existentials
-
 import org.apache.spark._
 import org.apache.spark.broadcast.Broadcast
 import org.apache.spark.internal.Logging
 import org.apache.spark.rdd.RDD
 import org.apache.spark.shuffle.ShuffleWriter
+
+import scala.collection.mutable
 
 /**
  * A ShuffleMapTask divides the elements of an RDD into multiple buckets (based on a partitioner
@@ -72,6 +73,16 @@ private[spark] class ShuffleMapTask(
 
   @transient private val preferredLocs: Seq[TaskLocation] = {
     if (locs == null) Nil else locs.toSet.toSeq
+  }
+
+  var hostToSize = new mutable.HashMap[String, Long]()
+
+  def setHostToSize(hs: mutable.HashMap[String, Long]) {
+    hs.foreach(m => hostToSize.put(m._1, m._2))
+  }
+
+  def getHostToSize(): mutable.HashMap[String, Long] = {
+    return hostToSize
   }
 
   override def runTask(context: TaskContext): MapStatus = {

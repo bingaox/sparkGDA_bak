@@ -25,7 +25,6 @@ import scala.collection.JavaConverters._
 import scala.collection.mutable.{ArrayBuffer, HashMap, HashSet, Map}
 import scala.reflect.ClassTag
 import scala.util.control.NonFatal
-
 import org.apache.spark.broadcast.{Broadcast, BroadcastManager}
 import org.apache.spark.internal.Logging
 import org.apache.spark.rpc.{RpcCallContext, RpcEndpoint, RpcEndpointRef, RpcEnv}
@@ -33,6 +32,8 @@ import org.apache.spark.scheduler.MapStatus
 import org.apache.spark.shuffle.MetadataFetchFailedException
 import org.apache.spark.storage.{BlockId, BlockManagerId, ShuffleBlockId}
 import org.apache.spark.util._
+
+import scala.collection.mutable
 
 private[spark] sealed trait MapOutputTrackerMessage
 private[spark] case class GetMapOutputStatuses(shuffleId: Int)
@@ -129,6 +130,17 @@ private[spark] abstract class MapOutputTracker(conf: SparkConf) extends Logging 
     getMapSizesByExecutorId(shuffleId, reduceId, reduceId + 1)
   }
 
+  def getMapSizesByExecutorIdAndTask(shuffleId: Int, startPartition: Int, endPartition: Int)
+  : mutable.HashMap[String, Seq[Long]] = {
+    logDebug(s"Fetching outputs for shuffle $shuffleId, partitions $startPartition-$endPartition")
+    val statuses = getStatuses(shuffleId)
+    // Synchronize on the returned array because, on the driver, it gets mutated in place
+    statuses.synchronized {
+      return MapOutputTracker.convertMapStatusesToLocationAndSize(shuffleId,
+        startPartition, endPartition, statuses)
+    }
+  }
+
   /**
    * Called from executors to get the server URIs and output sizes for each shuffle block that
    * needs to be read from a given range of map output partitions (startPartition is included but
@@ -172,6 +184,62 @@ private[spark] abstract class MapOutputTracker(conf: SparkConf) extends Logging 
    * (It would be nice to remove this restriction in the future.)
    */
   private def getStatuses(shuffleId: Int): Array[MapStatus] = {
+    val statuses = mapStatuses.get(shuffleId).orNull
+    if (statuses == null) {
+      logInfo("Don't have map outputs for shuffle " + shuffleId + ", fetching them")
+      val startTime = System.currentTimeMillis
+      var fetchedStatuses: Array[MapStatus] = null
+      fetching.synchronized {
+        // Someone else is fetching it; wait for them to be done
+        while (fetching.contains(shuffleId)) {
+          try {
+            fetching.wait()
+          } catch {
+            case e: InterruptedException =>
+          }
+        }
+
+        // Either while we waited the fetch happened successfully, or
+        // someone fetched it in between the get and the fetching.synchronized.
+        fetchedStatuses = mapStatuses.get(shuffleId).orNull
+        if (fetchedStatuses == null) {
+          // We have to do the fetch, get others to wait for us.
+          fetching += shuffleId
+        }
+      }
+
+      if (fetchedStatuses == null) {
+        // We won the race to fetch the statuses; do so
+        logInfo("Doing the fetch; tracker endpoint = " + trackerEndpoint)
+        // This try-finally prevents hangs due to timeouts:
+        try {
+          val fetchedBytes = askTracker[Array[Byte]](GetMapOutputStatuses(shuffleId))
+          fetchedStatuses = MapOutputTracker.deserializeMapStatuses(fetchedBytes)
+          logInfo("Got the output locations")
+          mapStatuses.put(shuffleId, fetchedStatuses)
+        } finally {
+          fetching.synchronized {
+            fetching -= shuffleId
+            fetching.notifyAll()
+          }
+        }
+      }
+      logDebug(s"Fetching map output statuses for shuffle $shuffleId took " +
+        s"${System.currentTimeMillis - startTime} ms")
+
+      if (fetchedStatuses != null) {
+        return fetchedStatuses
+      } else {
+        logError("Missing all output locations for shuffle " + shuffleId)
+        throw new MetadataFetchFailedException(
+          shuffleId, -1, "Missing all output locations for shuffle " + shuffleId)
+      }
+    } else {
+      return statuses
+    }
+  }
+
+  def getStatusesByShuffleID(shuffleId: Int): Array[MapStatus] = {
     val statuses = mapStatuses.get(shuffleId).orNull
     if (statuses == null) {
       logInfo("Don't have map outputs for shuffle " + shuffleId + ", fetching them")
@@ -705,4 +773,32 @@ private[spark] object MapOutputTracker extends Logging {
 
     splitsByAddress.toSeq
   }
+
+  private def convertMapStatusesToLocationAndSize(
+                                                   shuffleId: Int,
+                                                   startPartition: Int,
+                                                   endPartition: Int,
+                                                   statuses: Array[MapStatus]):
+  mutable.HashMap[String, Seq[Long]] = {
+    assert (statuses != null)
+    val splitsByAddress = new HashMap[String, ArrayBuffer[Long]]
+    for ((status, mapId) <- statuses.zipWithIndex) {
+      if (status == null) {
+        val errorMessage = s"Missing an output location for shuffle $shuffleId"
+        logError(errorMessage)
+        throw new MetadataFetchFailedException(shuffleId, startPartition, errorMessage)
+      } else {
+        for (part <- startPartition until endPartition) {
+          splitsByAddress.getOrElseUpdate(status.location.host, ArrayBuffer()) +=
+            (status.getSizeForBlock(part))
+        }
+      }
+    }
+    var splitsByAddress2 = new HashMap[String, Seq[Long]]
+    for (add <- splitsByAddress.keys) {
+      splitsByAddress2.put(add, splitsByAddress(add))
+    }
+    splitsByAddress2
+  }
 }
+

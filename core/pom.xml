@@ -51,6 +51,13 @@
       <artifactId>chill_${scala.binary.version}</artifactId>
     </dependency>
     <dependency>
+      <groupId>gurobi</groupId>
+      <artifactId>gurobi</artifactId>
+      <version>7.0</version>
+      <scope>system</scope>
+      <systemPath>/home/bingo/app/gurobi702/linux64/lib/gurobi.jar</systemPath>
+    </dependency>
+    <dependency>
       <groupId>com.twitter</groupId>
       <artifactId>chill-java</artifactId>
     </dependency>

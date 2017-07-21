@@ -17,8 +17,12 @@
 
 package org.apache.spark.scheduler
 
+import scala.collection.mutable
+
 /**
  * Represents free resources available on an executor.
  */
 private[spark]
-case class WorkerOffer(executorId: String, host: String, cores: Int)
+case class WorkerOffer(executorId: String, host: String, cores: Int,
+                       bandWidths: mutable.HashMap[String, Double],
+                       price: Double)

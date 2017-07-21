@@ -314,6 +314,147 @@ private[spark] class TaskSchedulerImpl private[scheduler](
     return launchedTask
   }
 
+  def resourceOffersWithPrice(offers: IndexedSeq[WorkerOffer]):
+  Seq[Seq[TaskDescription]] = synchronized {
+    // Mark each slave as alive and remember its hostname
+    // Also track if new executor is added
+    var newExecAvail = false
+    for (o <- offers) {
+      if (!hostToExecutors.contains(o.host)) {
+        hostToExecutors(o.host) = new HashSet[String]()
+      }
+      if (!executorIdToRunningTaskIds.contains(o.executorId)) {
+        hostToExecutors(o.host) += o.executorId
+        executorAdded(o.executorId, o.host)
+        executorIdToHost(o.executorId) = o.host
+        executorIdToRunningTaskIds(o.executorId) = HashSet[Long]()
+        newExecAvail = true
+      }
+      for (rack <- getRackForHost(o.host)) {
+        hostsByRack.getOrElseUpdate(rack, new HashSet[String]()) += o.host
+      }
+    }
+
+    // Before making any offers, remove any nodes from the blacklist whose blacklist has expired. Do
+    // this here to avoid a separate thread and added synchronization overhead, and also because
+    // updating the blacklist is only relevant when task offers are being made.
+    blacklistTrackerOpt.foreach(_.applyBlacklistTimeout())
+
+    val filteredOffers = blacklistTrackerOpt.map { blacklistTracker =>
+      offers.filter { offer =>
+        !blacklistTracker.isNodeBlacklisted(offer.host) &&
+          !blacklistTracker.isExecutorBlacklisted(offer.executorId)
+      }
+    }.getOrElse(offers)
+
+    val shuffledOffers = shuffleOffers(filteredOffers)
+    // Build a list of tasks to assign to each worker.
+    val tasks = shuffledOffers.map(o => new ArrayBuffer[TaskDescription](o.cores))
+    val availableCpus = shuffledOffers.map(o => o.cores).toArray
+    val sortedTaskSets = rootPool.getSortedTaskSetQueue
+    for (taskSet <- sortedTaskSets) {
+      logDebug("parentName: %s, name: %s, runningTasks: %s".format(
+        taskSet.parent.name, taskSet.name, taskSet.runningTasks))
+      if (newExecAvail) {
+        taskSet.executorAdded()
+      }
+    }
+
+    // Take each TaskSet in our scheduling order, and then offer it each node in increasing order
+    // of locality levels so that it gets a chance to launch local tasks on all of them.
+    // NOTE: the preferredLocality order: PROCESS_LOCAL, NODE_LOCAL, NO_PREF, RACK_LOCAL, ANY
+
+    for (taskSet <- sortedTaskSets) {
+      if (taskSet.taskSet.isShuffleDependency == true) {
+        logInfo(s"bingo go to price: Step1")
+        resourceOfferSingleTaskSetWithPrice(
+          taskSet, TaskLocality.ANY, shuffledOffers, availableCpus, tasks)
+      }
+      else {
+        var launchedAnyTask = false
+        var launchedTaskAtCurrentMaxLocality = false
+        for (currentMaxLocality <- taskSet.myLocalityLevels) {
+          do {
+            launchedTaskAtCurrentMaxLocality = resourceOfferSingleTaskSet(
+              taskSet, currentMaxLocality, shuffledOffers, availableCpus, tasks)
+            launchedAnyTask |= launchedTaskAtCurrentMaxLocality
+          } while (launchedTaskAtCurrentMaxLocality)
+        }
+        if (!launchedAnyTask) {
+          taskSet.abortIfCompletelyBlacklisted(hostToExecutors)
+        }
+      }
+
+
+    }
+
+    if (tasks.size > 0) {
+      hasLaunchedTask = true
+    }
+    return tasks
+  }
+
+
+  private def resourceOfferSingleTaskSetWithPrice(taskSet: TaskSetManager,
+                                                  maxLocality: TaskLocality,
+                                                  shuffledOffers: Seq[WorkerOffer],
+                                                  availableCpus: Array[Int],
+                                                  tasks: IndexedSeq[ArrayBuffer[TaskDescription]]):
+  Boolean = {
+    var launchedTask = false
+    // nodes and executors that are blacklisted for the entire application have already been
+    // filtered out by this point
+    var availableCpus2 = availableCpus.to[ArrayBuffer]
+    var initPriceSuccess = taskSet.initTaskToOfferMap(shuffledOffers, availableCpus)
+    if (initPriceSuccess) {
+      for (i <- 0 until shuffledOffers.size) {
+        var t = taskSet.resourceOfferByPrice(maxLocality, shuffledOffers, availableCpus2)
+
+        t match {
+          case Some((task, i)) =>
+            tasks(i) += task
+            val tid = task.taskId
+            taskIdToTaskSetManager(tid) = taskSet
+            taskIdToExecutorId(tid) = task.executorId
+            executorIdToRunningTaskIds(task.executorId).add(tid)
+            launchedTask = true
+          case _ =>
+        }
+      }
+      return launchedTask
+    }
+    else {
+      for (i <- 0 until shuffledOffers.size) {
+        val execId = shuffledOffers(i).executorId
+        val host = shuffledOffers(i).host
+        if (availableCpus(i) >= CPUS_PER_TASK) {
+          try {
+            for (task <- taskSet.resourceOffer(execId, host, maxLocality)) {
+              tasks(i) += task
+              val tid = task.taskId
+              taskIdToTaskSetManager(tid) = taskSet
+              taskIdToExecutorId(tid) = execId
+              executorIdToRunningTaskIds(execId).add(tid)
+              availableCpus(i) -= CPUS_PER_TASK
+              assert(availableCpus(i) >= 0)
+              launchedTask = true
+            }
+          } catch {
+            case e: TaskNotSerializableException =>
+              logError(s"Resource offer failed, task set ${taskSet.name} was not serializable")
+              // Do not offer resources for this task, but don't throw an error to allow other
+              // task sets to be submitted.
+              return launchedTask
+          }
+        }
+      }
+      return launchedTask
+    }
+
+
+  }
+
+
   /**
    * Called by cluster manager to offer resources on slaves. We respond by asking our active task
    * sets for tasks in order of priority. We fill each node with tasks in a round-robin manner so
