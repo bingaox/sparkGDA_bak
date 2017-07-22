@@ -26,6 +26,8 @@ import org.apache.spark._
 import org.apache.spark.broadcast.Broadcast
 import org.apache.spark.rdd.RDD
 
+import scala.collection.mutable
+
 /**
  * A task that sends back the output to the driver application.
  *
@@ -68,6 +70,17 @@ private[spark] class ResultTask[T, U](
   @transient private[this] val preferredLocs: Seq[TaskLocation] = {
     if (locs == null) Nil else locs.toSet.toSeq
   }
+
+  var hostToSize = new mutable.HashMap[String, Long]()
+
+  def setHostToSize(hs: mutable.HashMap[String, Long]) {
+    hs.foreach(m => hostToSize.put(m._1, m._2))
+  }
+
+  def getHostToSize(): mutable.HashMap[String, Long] = {
+    return hostToSize
+  }
+
 
   override def runTask(context: TaskContext): U = {
     // Deserialize the RDD and the func using the broadcast variables.

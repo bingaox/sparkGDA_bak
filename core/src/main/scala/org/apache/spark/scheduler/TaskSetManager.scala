@@ -21,6 +21,8 @@ import java.io.NotSerializableException
 import java.nio.ByteBuffer
 import java.util.concurrent.ConcurrentLinkedQueue
 
+import gurobi._
+import scala.collection.mutable
 import scala.collection.mutable.{ArrayBuffer, HashMap, HashSet}
 import scala.math.max
 import scala.util.control.NonFatal
@@ -29,6 +31,7 @@ import org.apache.spark._
 import org.apache.spark.internal.Logging
 import org.apache.spark.scheduler.SchedulingMode._
 import org.apache.spark.TaskState.TaskState
+import org.apache.spark.scheduler.TaskLocality.TaskLocality
 import org.apache.spark.util.{AccumulatorV2, Clock, SystemClock, Utils}
 import org.apache.spark.util.collection.MedianHeap
 
@@ -113,6 +116,8 @@ private[spark] class TaskSetManager(
   // TODO: We should kill any running task attempts when the task set manager becomes a zombie.
   private[scheduler] var isZombie = false
 
+  val CPUS_PER_TASK = conf.getInt("spark.task.cpus", 1)
+
   // Set of pending tasks for each executor. These collections are actually
   // treated as stacks, in which new tasks are added to the end of the
   // ArrayBuffer and removed from the end. This makes it faster to detect
@@ -139,6 +144,8 @@ private[spark] class TaskSetManager(
 
   // Set containing all pending tasks (also used as a stack, as above).
   private val allPendingTasks = new ArrayBuffer[Int]
+
+  var pendingTasksToOfferMap = new HashMap[Task[_], WorkerOffer]
 
   // Tasks that can be speculated. Since these will be a small fraction of total
   // tasks, we'll just hold them in a HashSet.
@@ -368,6 +375,52 @@ private[spark] class TaskSetManager(
 
     None
   }
+
+  private def dequeueTaskFromListByLpt(list: ArrayBuffer[Int]): Option[Int] = {
+    var indexOffset = list.size
+    while (indexOffset > 0) {
+      indexOffset -= 1
+      val index = list(indexOffset)
+
+      // This should almost always be list.trimEnd(1) to remove tail
+      list.remove(indexOffset)
+      if (copiesRunning(index) == 0 && !successful(index)) {
+        return Some(index)
+      }
+    }
+    None
+  }
+
+  private def dequeueTaskByPrice(maxLocality: TaskLocality.Value)
+  : Option[(Int, TaskLocality.Value, Boolean)] =
+  {
+    if (TaskLocality.isAllowed(maxLocality, TaskLocality.ANY)) {
+      for (index <- dequeueTaskFromListByLpt(allPendingTasks)) {
+        return Some((index, TaskLocality.ANY, false))
+      }
+    }
+
+    // find a speculative task if all others tasks have been scheduled
+    dequeueSpeculativeTaskByLpt(maxLocality).map {
+      case (taskIndex, allowedLocality) => (taskIndex, allowedLocality, true)}
+  }
+
+  protected def dequeueSpeculativeTaskByLpt(locality: TaskLocality.Value)
+  : Option[(Int, TaskLocality.Value)] =
+  {
+    speculatableTasks.retain(index => !successful(index)) // Remove finished tasks from set
+    if (!speculatableTasks.isEmpty) {
+      // Check for non-local tasks
+      if (TaskLocality.isAllowed(locality, TaskLocality.ANY)) {
+        for (index <- speculatableTasks) {
+          speculatableTasks -= index
+          return Some((index, TaskLocality.ANY))
+        }
+      }
+    }
+    None
+  }
+
 
   /**
    * Dequeue a pending task for a given node and return its index and locality level.
@@ -889,6 +942,253 @@ private[spark] class TaskSetManager(
     sortedTaskSetQueue
   }
 
+  def initTaskToOfferMap(shuffledOffers: Seq[WorkerOffer],
+                         availableCpus: Array[Int]): Boolean = {
+    var taskToWorkerOffer = getTaskToWorkOfferMap(shuffledOffers, availableCpus)
+    taskToWorkerOffer match {
+      case Some(taskToOffer) =>
+        pendingTasksToOfferMap = taskToOffer
+        return true
+      case None =>
+        return false
+    }
+  }
+
+  def getTaskToWorkOfferMap(shuffledOffers: Seq[WorkerOffer],
+                            availableCpus: Array[Int])
+  : Option[mutable.HashMap[Task[_], WorkerOffer]] = {
+    logInfo(s"#go into get TaskToWorkOfferMap")
+    try {
+      val curTime = clock.getTimeMillis()
+      var hostToOffersMap = mutable.HashMap[String, ArrayBuffer[WorkerOffer]]()
+      for (offer <- shuffledOffers) {
+        if (!hostToOffersMap.contains(offer.host)) {
+          hostToOffersMap(offer.host) = ArrayBuffer()
+          hostToOffersMap(offer.host) += offer
+        }
+        else {
+          hostToOffersMap(offer.host) += offer
+        }
+      }
+      var hostToPriceMap: mutable.HashMap[String, Double] = mutable.HashMap[String, Double]()
+      for (offer <- shuffledOffers) {
+        if (!hostToPriceMap.contains(offer.host)) {
+          hostToPriceMap(offer.host) = offer.price
+        }
+      }
+      var hostToHostBWMap = mutable.HashMap[String, mutable.HashMap[String, Double]]()
+      for (offer <- shuffledOffers) {
+        if (!hostToHostBWMap.contains(offer.host)) {
+          hostToHostBWMap(offer.host) = offer.bandWidths
+        }
+      }
+      var env = new GRBEnv("~/taskPlaceOpt.log")
+      var model = new GRBModel(env)
+      // set obj
+      var taskSize = tasks.length
+      var shuffleOfferSize = hostToHostBWMap.keys.toArray.length
+      var r: Array[Array[GRBVar]] = Array.ofDim[GRBVar](tasks.length,
+        hostToHostBWMap.keys.toArray.length)
+      for (i <- 0 until taskSize) {
+        for (j <- 0 until shuffleOfferSize) {
+          var rName = "r_" + i + "_" + j
+          r(i)(j) = model.addVar(0, 1, 1, GRB.BINARY, rName)
+        }
+      }
+
+      //
+      var objLinExpr: GRBLinExpr = new GRBLinExpr()
+      for ((host, i) <- hostToPriceMap.keys.zipWithIndex ) {
+        for ((task, j) <- tasks.zipWithIndex) {
+          var oName: String = "o_" + host + "_" + task.partitionId
+          var Mij: Long = 0
+          task match {
+            case task: ShuffleMapTask =>
+              Mij = task.getHostToSize()(host)
+            case task: ResultTask[_, _] =>
+              Mij = task.getHostToSize()(host)
+          }
+          objLinExpr.addConstant(hostToPriceMap(host)*Mij)
+          objLinExpr.addTerm(-1*hostToPriceMap(host)*Mij, r(j)(i))
+        }
+      }
+      model.setObjective(objLinExpr, GRB.MINIMIZE)
+
+      // (1)
+      for ( k <- 0 until taskSize) {
+        var rLinExpr: GRBLinExpr = new GRBLinExpr()
+
+        for(j <- 0 until shuffleOfferSize) {
+          rLinExpr.addTerm(1.0, r(k)(j))
+        }
+        var rName: String = "r_" + k
+        model.addConstr(rLinExpr, GRB.EQUAL, 1, rName)
+      }
+
+      // (3)
+      for ((hosti, i) <- hostToHostBWMap.keys.zipWithIndex ) {
+        for ((hostk, k) <- hostToHostBWMap.keys.zipWithIndex if i!=k) {
+          var zLinExpr: GRBLinExpr = new GRBLinExpr()
+          for ((task, j) <- tasks.zipWithIndex ) {
+            var Mij: Long = 0
+            task match {
+              case task: ShuffleMapTask =>
+                Mij = task.getHostToSize()(hosti)
+              case task: ResultTask[_, _] =>
+                Mij = task.getHostToSize()(hosti)
+            }
+            zLinExpr.addTerm(Mij/hostToHostBWMap(hosti)(hostk), r(j)(k))
+          }
+          var z = conf.getLong("spark.scheduler.CAG.maxZ", defaultValue = Long.MaxValue)
+          zLinExpr.addConstant(-1*z)
+          var zName: String = "z" + i + "_" + k + "_"
+          model.addConstr(zLinExpr, GRB.LESS_EQUAL, 0.0, zName)
+        }
+      }
+
+      // (2)
+      for ((hostk, k) <- hostToHostBWMap.keys.zipWithIndex) {
+        var linExpr: GRBLinExpr = new GRBLinExpr()
+        for (j <- 0 until taskSize) {
+          linExpr.addTerm(1, r(j)(k))
+        }
+        var cName: String = "C_" + k + "_"
+        linExpr.addConstant((-1) * hostToOffersMap(hostk).toArray.length)
+        model.addConstr(linExpr, GRB.LESS_EQUAL, 0.0, cName)
+      }
+
+      model.optimize()
+
+      var optimizeStatus = model.get(GRB.IntAttr.Status)
+
+      var taskToHostMap = mutable.HashMap[Task[_], String]()
+      if (optimizeStatus == GRB.OPTIMAL) {
+        var rObj = model.get(GRB.DoubleAttr.X, r)
+        for ((task, i) <- tasks.zipWithIndex) {
+          for ((hostj, j) <- hostToHostBWMap.keys.zipWithIndex) {
+            if (rObj(i)(j).toInt == 1) {
+              taskToHostMap.put(task, hostj)
+            }
+          }
+        }
+      }
+      var rObj = model.get(GRB.DoubleAttr.X, r)
+      // print(rObj.length)
+
+      logInfo(s"$rObj")
+
+      for (i <- 0 until taskSize) {
+        logInfo(s"task$i")
+        for (j <- 0 until shuffleOfferSize) {
+          logInfo(s"   ${rObj(i)(j).toInt}")
+        }
+      }
+
+      logInfo(s"${rObj.length}")
+      model.write("~/taskPlace2.lp")
+      var taskToOffer = mutable.HashMap[Task[_], WorkerOffer]()
+      for (task <- taskToHostMap.keys) {
+        var taskSetToHost = taskToHostMap(task)
+        var offerOffset = hostToOffersMap(taskSetToHost).length
+        if (offerOffset > 0) {
+          var offer = hostToOffersMap(taskSetToHost).remove(offerOffset-1)
+          taskToOffer.put(task, offer)
+        }
+      }
+      model.write("")
+      model.dispose()
+      env.dispose()
+      Some(taskToOffer)
+    }
+    catch {
+      case e: Throwable =>
+        logInfo(s"bingo error! cannot resolve Gurobi Optimize! $e")
+        None
+    }
+
+  }
+
+  def resourceOfferByPrice(maxLocality: TaskLocality,
+                           shuffledOffers: Seq[WorkerOffer],
+                           availableCpus: ArrayBuffer[Int])
+  : Option[(TaskDescription, Int)] =
+  {
+    logInfo(s"#go into resourceOfferByLpt#")
+    if (!isZombie) {
+      val curTime = clock.getTimeMillis()
+      var allowedLocality = maxLocality
+      // logInfo(s"bingo go to lpt: Step3")
+      var workerOfferToIndexMap = new mutable.HashMap[WorkerOffer, Int]()
+      for (i <- 0 until shuffledOffers.size) {
+        workerOfferToIndexMap.put(shuffledOffers( i), i)
+      }
+
+      dequeueTaskByPrice(allowedLocality).map{ case ((index, taskLocality, speculative)) =>
+        // logInfo(s"bingo dequeueTask index is $index")
+        val task = tasks(index)
+        var taskDescrition: TaskDescription = null
+        val taskId = sched.newTaskId()
+        // Do various bookkeeping
+        copiesRunning(index) += 1
+        val attemptNum = taskAttempts(index).size
+        var i: Int = 0
+
+        var launchedTask = false
+        var wo = pendingTasksToOfferMap(task)
+        i = workerOfferToIndexMap(wo)
+        if (availableCpus(i) >= CPUS_PER_TASK) {
+          val info = new TaskInfo(taskId, index, attemptNum, curTime,
+            wo.executorId, wo.host, taskLocality, speculative)
+          taskInfos(taskId) = info
+          taskAttempts(index) = info :: taskAttempts(index)
+          if (maxLocality != TaskLocality.NO_PREF) {
+            currentLocalityIndex = getLocalityIndex(taskLocality)
+            lastLaunchTime = curTime
+          }
+          val serializedTask: ByteBuffer = try {
+            ser.serialize(task)
+          } catch {
+            // If the task cannot be serialized, then there's no point to re-attempt the task,
+            // as it will always fail. So just abort the whole task-set.
+            case NonFatal(e) =>
+              val msg = s"Failed to serialize task $taskId, not attempting to retry it."
+              logError(msg, e)
+              abort(s"$msg Exception during serialization: $e")
+              throw new TaskNotSerializableException(e)
+          }
+          if (serializedTask.limit > TaskSetManager.TASK_SIZE_TO_WARN_KB * 1024 &&
+            !emittedTaskSizeWarning) {
+            emittedTaskSizeWarning = true
+            logWarning(s"Stage ${task.stageId} contains a task of very large size " +
+              s"(${serializedTask.limit / 1024} KB). The maximum recommended task size is " +
+              s"${TaskSetManager.TASK_SIZE_TO_WARN_KB} KB.")
+          }
+          addRunningTask(taskId)
+          val taskName = s"task ${info.id} in stage ${taskSet.id}"
+          logInfo(s"Starting $taskName (TID $taskId, ${wo.host}, executor ${info.executorId}, " +
+            s"partition ${task.partitionId}, $taskLocality, ${serializedTask.limit} bytes)")
+          launchedTask = true
+          sched.dagScheduler.taskStarted(task, info)
+          taskDescrition = new TaskDescription(
+            taskId,
+            attemptNum,
+            wo.executorId,
+            taskName,
+            index,
+            sched.sc.addedFiles,
+            sched.sc.addedJars,
+            task.localProperties,
+            serializedTask)
+          availableCpus(i) -= CPUS_PER_TASK
+        }
+        return Some((taskDescrition, i))
+      }
+    } else {
+      None
+    }
+
+  }
+
   /** Called by TaskScheduler when an executor is lost so we can re-enqueue our tasks */
   override def executorLost(execId: String, host: String, reason: ExecutorLossReason) {
     // Re-enqueue any tasks that ran on the failed executor if this is a shuffle map stage,
@@ -984,7 +1284,7 @@ private[spark] class TaskSetManager(
    *
    */
   private def computeValidLocalityLevels(): Array[TaskLocality.TaskLocality] = {
-    import TaskLocality.{PROCESS_LOCAL, NODE_LOCAL, NO_PREF, RACK_LOCAL, ANY}
+    import TaskLocality._
     val levels = new ArrayBuffer[TaskLocality.TaskLocality]
     if (!pendingTasksForExecutor.isEmpty &&
         pendingTasksForExecutor.keySet.exists(sched.isExecutorAlive(_))) {

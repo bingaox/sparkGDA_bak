@@ -23,15 +23,13 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 
 import scala.annotation.tailrec
-import scala.collection.Map
+import scala.collection.{Map, mutable}
 import scala.collection.mutable.{HashMap, HashSet, Stack}
 import scala.concurrent.duration._
 import scala.language.existentials
 import scala.language.postfixOps
 import scala.util.control.NonFatal
-
 import org.apache.commons.lang3.SerializationUtils
-
 import org.apache.spark._
 import org.apache.spark.broadcast.Broadcast
 import org.apache.spark.executor.TaskMetrics
@@ -380,6 +378,30 @@ class DAGScheduler(
     getShuffleDependencies(rdd).map { shuffleDep =>
       getOrCreateShuffleMapStage(shuffleDep, firstJobId)
     }.toList
+  }
+
+  private def getDependShuffleId(rdd: RDD[_], jobId: Int): List[Int] = {
+    val parents = new HashSet[Int]
+    val visited = new HashSet[RDD[_]]
+
+    def visit(r: RDD[_]) {
+      if (!visited(r)) {
+        visited += r
+        // Kind of ugly: need to register RDDs with the cache here since
+        // we can't do it in its constructor because # of partitions is unknown
+        for (dep <- r.dependencies) {
+          dep match {
+            case shufDep: ShuffleDependency[_, _, _] =>
+              parents += shufDep.shuffleId
+            case _ =>
+              visit(dep.rdd)
+          }
+        }
+      }
+    }
+
+    visit(rdd)
+    parents.toList
   }
 
   /** Find ancestor shuffle dependencies that are not registered in shuffleToMapStage yet */
@@ -1049,11 +1071,52 @@ class DAGScheduler(
         return
     }
 
+    var isShuffleDependency: Boolean = false
+
+    var shuffleIDList = getDependShuffleId(stage.rdd, jobId)
+
+    if (shuffleIDList.length != 0 ) {
+      isShuffleDependency = true
+    }
+    shuffleIDList.foreach(id => logInfo(s"bingo shuffle ID is $id"))
+    if (isShuffleDependency) {
+      for (task <- tasks) {
+        var mapStatuses = new mutable.HashMap[String, mutable.ArrayBuffer[Long]]()
+        for (id <- shuffleIDList) {
+          var mapStatus = mapOutputTracker.getMapSizesByExecutorIdAndTask(id,
+            task.partitionId, task.partitionId + 1)
+          mapStatus.keys.foreach(m =>
+            if (mapStatuses.contains(m)) {
+              mapStatuses(m) ++= mapStatus(m).toArray
+            }
+            else {
+              mapStatuses.put(m, mutable.ArrayBuffer())
+              mapStatuses(m) ++= mapStatus(m).toArray
+            }
+          )
+        }
+        task match {
+          case task: ShuffleMapTask =>
+            var m = new mutable.HashMap[String, Long]()
+            mapStatuses.foreach(s => m.put(s._1
+              , s._2.toSeq.sum))
+            task.setHostToSize(m)
+          case task: ResultTask[_, _] =>
+            var m = new mutable.HashMap[String, Long]()
+            mapStatuses.foreach(s => m.put(s._1
+              , s._2.toSeq.sum))
+            task.setHostToSize(m)
+        }
+      }
+
+    }
+
     if (tasks.size > 0) {
       logInfo(s"Submitting ${tasks.size} missing tasks from $stage (${stage.rdd}) (first 15 " +
         s"tasks are for partitions ${tasks.take(15).map(_.partitionId)})")
       taskScheduler.submitTasks(new TaskSet(
-        tasks.toArray, stage.id, stage.latestInfo.attemptId, jobId, properties))
+        tasks.toArray, stage.id, stage.latestInfo.attemptId, jobId,
+        properties, isShuffleDependency))
       stage.latestInfo.submissionTime = Some(clock.getTimeMillis())
     } else {
       // Because we posted SparkListenerStageSubmitted earlier, we should mark

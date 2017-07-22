@@ -25,7 +25,6 @@ import java.util.concurrent.atomic.AtomicBoolean
 import scala.collection.mutable
 import scala.util.{Failure, Success}
 import scala.util.control.NonFatal
-
 import org.apache.spark._
 import org.apache.spark.TaskState.TaskState
 import org.apache.spark.deploy.SparkHadoopUtil
@@ -36,6 +35,8 @@ import org.apache.spark.scheduler.{ExecutorLossReason, TaskDescription}
 import org.apache.spark.scheduler.cluster.CoarseGrainedClusterMessages._
 import org.apache.spark.serializer.SerializerInstance
 import org.apache.spark.util.{ThreadUtils, Utils}
+
+import scala.io.Source
 
 private[spark] class CoarseGrainedExecutorBackend(
     override val rpcEnv: RpcEnv,
@@ -55,12 +56,70 @@ private[spark] class CoarseGrainedExecutorBackend(
   // to be changed so that we don't share the serializer instance across threads
   private[this] val ser: SerializerInstance = env.closureSerializer.newInstance()
 
+  def readBandWidthFromDisk(fileName: String, hostName: String): mutable.HashMap[String, Double] = {
+    val sourceFile = Source.fromFile(fileName)
+    val lines = sourceFile.getLines().toList
+    // lines.foreach(line => println(line.mkString))
+    var hostToBandWidth = new mutable.HashMap[String, Double]
+    if(lines.length == 0)
+    {
+      logWarning(s"bingo warning! You may not set bandwidth info.")
+    }
+    else
+    {
+      lines.foreach(
+        line => {
+          val s = line.toString().split(" ")
+          val sourceHost = s(0).mkString
+          val destHost = s(1).mkString
+          val bandWidth = s(2).mkString.toDouble
+          if (sourceHost.compare(hostName) == 0) {
+            // println(destHost,bandWidth)
+            hostToBandWidth.put(destHost, bandWidth)
+          }
+        }
+
+      )
+    }
+    hostToBandWidth
+  }
+
+  def readPriceFromDisk(fileName: String, hostName: String): Double = {
+    val sourceFile = Source.fromFile(fileName)
+    val lines = sourceFile.getLines().toList
+    var hostPrice: Double = 0.0
+    if (lines.length == 0) {
+      logWarning(s"bingo warning! You may not set price info.")
+    }
+    else {
+      lines.foreach(
+        line => {
+          val s = line.toString().split(" ")
+          val sourceHost = s(0).mkString
+          val price = s(1).mkString.toDouble
+          if (sourceHost.compareTo(hostName) == 0) {
+            hostPrice = price
+          }
+        }
+      )
+    }
+    hostPrice
+  }
+
   override def onStart() {
     logInfo("Connecting to driver: " + driverUrl)
     rpcEnv.asyncSetupEndpointRefByURI(driverUrl).flatMap { ref =>
       // This is a very fast action so we can use "ThreadUtils.sameThread"
       driver = Some(ref)
-      ref.ask[Boolean](RegisterExecutor(executorId, self, hostname, cores, extractLogUrls))
+      val bandWidths = readBandWidthFromDisk("/home/bingo/bw.txt", hostname)
+      bandWidths.foreach(s =>
+        logInfo(s._1 + "bandwidth" + s._2)
+      )
+      val price = readPriceFromDisk("/home/bingo/price.txt", hostname)
+      logInfo(s"host name is $hostname **************************************")
+      logInfo(s"price is $price **************************************")
+      ref.ask[Boolean](RegisterExecutor(executorId, self, hostname, cores,
+        extractLogUrls, bandWidths, price))
     }(ThreadUtils.sameThread).onComplete {
       // This is a very fast action so we can use "ThreadUtils.sameThread"
       case Success(msg) =>
